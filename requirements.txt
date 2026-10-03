@@ -1,0 +1,5 @@
+gradio>=5,<7
+kokoro>=0.9.4
+misaki[en]
+soundfile
+numpy
