@@ -15,6 +15,8 @@ echo Instalacao da interface concluida.
 echo Ainda e necessario instalar:
 echo 1. eSpeak-NG no Windows
 echo 2. FFmpeg
-echo 3. SadTalker e seus checkpoints em ambiente separado
+echo 3. SadTalker e seus checkpoints 512 em ambiente separado (motor Standard)
+echo 4. Opcional: EchoMimic em ambiente separado (motor Experimental HD)
+echo Veja o README.md.
 echo.
 pause
