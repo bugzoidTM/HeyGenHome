@@ -1,0 +1,21 @@
+# Ambiente Python local (recriado via instalar_app.bat)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Artefatos gerados pela app (áudio/vídeo locais)
+outputs/
+*.wav
+*.mp4
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Segredos locais (manter apenas o exemplo versionado)
+.env
+.env.ps1
