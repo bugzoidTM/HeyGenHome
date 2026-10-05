@@ -8,6 +8,9 @@ import gradio as gr
 from heygenhome.engines import (
     FRAMING_CROP,
     FRAMING_FULL,
+    MOTION_EXPRESSIVE,
+    MOTION_NATURAL,
+    MOTION_STILL,
     AnimationOptions,
     EngineError,
     EngineRun,
@@ -32,6 +35,8 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # Motores configurados por variáveis de ambiente (veja o README).
 ENGINE = create_engine()
 DEFAULT_ENGINE = ENGINE.backends()[0].key
+for _backend in ENGINE.backends():
+    _backend.hardware()  # começa a detectar a GPU em segundo plano
 
 FRAMING_CHOICES = [
     ("Foto inteira (padrão)", FRAMING_FULL),
@@ -41,12 +46,19 @@ FORMAT_CHOICES = [
     ("Original", FORMAT_ORIGINAL),
     ("9:16 vertical (sem corte)", FORMAT_VERTICAL),
 ]
+MOTION_CHOICES = [
+    ("Estável", MOTION_STILL),
+    ("Natural (padrão)", MOTION_NATURAL),
+    ("Expressivo", MOTION_EXPRESSIVE),
+]
 BACKGROUND_CHOICES = [
     ("Desfocado", BACKGROUND_BLUR),
     ("Preto", BACKGROUND_BLACK),
 ]
 FORMAT_LABELS = {value: label for label, value in FORMAT_CHOICES}
 FRAMING_SHORT = {FRAMING_FULL: "foto inteira", FRAMING_CROP: "só o rosto"}
+MOTION_SHORT = {MOTION_STILL: "movimento estável", MOTION_NATURAL: "movimento natural",
+                MOTION_EXPRESSIVE: "movimento expressivo"}
 
 # O player e a prévia da foto nunca cortam: mostram o quadro inteiro (contain).
 CSS = """
@@ -63,9 +75,9 @@ def engine_markdown(backend: TalkingHeadBackend) -> str:
     status = backend.status()
     head = f"**{backend.label}** — {backend.name}. {backend.description}"
     if not status.ready:
-        lines = [head, "", "❌ **Não instalado:**"] + [f"- {p}" for p in status.problems]
-    else:
-        lines = [head, "", "✅ Pronto."] + [f"- ⚠️ {w}" for w in status.warnings]
+        return "\n".join([head, "", "❌ **Não instalado:**"] + [f"- {p}" for p in status.problems])
+    hardware = backend.hardware() or "Verificando a GPU…"
+    lines = [head, "", "✅ Pronto.", f"- 🖥️ {hardware}"] + [f"- ⚠️ {w}" for w in status.warnings]
     return "\n".join(lines)
 
 
@@ -75,10 +87,40 @@ def on_engine_change(key: str):
     size = 512 if 512 in caps.sizes else caps.sizes[0]
     return (
         engine_markdown(backend),
-        gr.update(interactive=caps.still),
+        gr.update(interactive=caps.motion),
         gr.update(interactive=caps.enhancer),
         gr.update(choices=size_choices(backend), value=size),
     )
+
+
+def refresh_hardware(key: str):
+    """Atualiza a linha da GPU até a detecção de todos os motores terminar."""
+    pending = any(b.status().ready and b.hardware() is None for b in ENGINE.backends())
+    return engine_markdown(ENGINE.get(key)), gr.Timer(active=pending)
+
+
+def processing_summary(details: dict) -> str:
+    """Onde e quão rápido o motor rodou, a partir do meta JSON do runner."""
+    if not details:
+        return "—"
+    device = str(details.get("device", "cpu"))
+    if device.startswith("cuda"):
+        parts = [f"GPU {details.get('device_name') or device}"]
+        if details.get("fp16"):
+            parts.append("fp16")
+        if details.get("batch"):
+            parts.append(f"lote {details['batch']}")
+    else:
+        parts = ["CPU"]
+        if details.get("threads"):
+            parts.append(f"{details['threads']} threads")
+    if details.get("sec_per_frame"):
+        parts.append(f"{details['sec_per_frame']:.2f} s/quadro")
+    if details.get("fallback"):
+        parts.append(f"terminou em CPU: {details['fallback']}")
+    elif details.get("gpu_error") and not device.startswith("cuda"):
+        parts.append("GPU não usada: " + str(details["gpu_error"])[:90])
+    return " · ".join(parts)
 
 
 def new_job_dir(engine_key: str) -> Path:
@@ -100,9 +142,10 @@ def build_report(
     options = [
         f"{req.size} px",
         FRAMING_SHORT[req.framing],
-        "cabeça estável" if req.still else "cabeça livre",
         "com melhoria de rosto (GFPGAN)" if req.enhancer else "sem melhoria de rosto",
     ]
+    if run.backend.capabilities.motion:
+        options.insert(2, MOTION_SHORT[req.motion])
     photo = f"{img.size[0]}x{img.size[1]}"
     if img.size != img.original_size:
         photo += f" (enviada {img.original_size[0]}x{img.original_size[1]})"
@@ -117,6 +160,7 @@ def build_report(
         f"| Foto | {photo} |",
         f"| Voz | {audio_duration:.2f}s |",
         f"| Saída do motor | {raw.resolution} · {raw.codec} · {raw.fps:g} fps · {raw.duration:.2f}s |",
+        f"| Processamento | {processing_summary(run.details)} |",
         f"| MP4 final | **{final.resolution}** · {final.codec}/{final.audio_codec} · "
         f"{FORMAT_LABELS[export.fmt]} · {final.duration:.2f}s · ✅ resolução validada |",
         f"| Tempo | voz {fmt_seconds(timings['tts'])} · animação {fmt_seconds(timings['engine'])} · "
@@ -132,7 +176,7 @@ def build_report(
 
 
 def generate(
-    photo, text, voice, speed, engine_key, framing, still, size, enhancer, fmt, background,
+    photo, text, voice, speed, engine_key, framing, motion, size, enhancer, fmt, background,
     progress=gr.Progress(),
 ):
     if not photo:
@@ -150,9 +194,16 @@ def generate(
 
         progress(0.2, desc=f"Animando o avatar ({backend.label} — {backend.name})…")
         options = AnimationOptions(
-            size=int(size), framing=framing, still=bool(still), enhancer=bool(enhancer)
+            size=int(size), framing=framing, motion=motion, enhancer=bool(enhancer)
         )
-        run = ENGINE.animate(engine_key, photo, wav, job_dir, options, audio_duration=audio_duration)
+
+        def engine_progress(fraction: float, message: str) -> None:
+            progress(0.2 + 0.7 * fraction, desc=message)
+
+        run = ENGINE.animate(
+            engine_key, photo, wav, job_dir, options,
+            audio_duration=audio_duration, progress=engine_progress,
+        )
         timings["engine"] = run.seconds
 
         progress(0.9, desc="Exportando e validando o MP4…")
@@ -177,7 +228,7 @@ def generate(
 
 
 default_backend = ENGINE.get(DEFAULT_ENGINE)
-blocks_kwargs = {"title": "Avatar Falante Local — CPU"}
+blocks_kwargs = {"title": "Avatar Falante Local"}
 launch_kwargs = {}
 # Gradio 5 recebe o CSS em Blocks(); o Gradio 6 em launch().
 if "css" in inspect.signature(gr.Blocks.__init__).parameters:
@@ -191,7 +242,8 @@ with gr.Blocks(**blocks_kwargs) as demo:
 # Avatar Falante Local
 **Foto + texto → voz PT-BR → vídeo MP4**, rodando localmente e sem API paga.
 
-Primeiro teste com textos curtos (1–3 frases), pois a animação em CPU é a etapa mais lenta.
+Primeiro teste com textos curtos (1–3 frases). Com GPU NVIDIA a animação leva minutos;
+só com CPU, a etapa de animação é bem mais lenta.
 """
     )
 
@@ -222,6 +274,13 @@ Primeiro teste com textos curtos (1–3 frases), pois a animação em CPU é a e
                 label="MOTOR DO AVATAR",
             )
             engine_info = gr.Markdown(engine_markdown(default_backend))
+            motion = gr.Radio(
+                MOTION_CHOICES,
+                value=MOTION_NATURAL,
+                label="Movimento",
+                info="Natural: cabeça se move de leve, lábios marcados e piscadas. "
+                     "Estável: só rosto e lábios.",
+            )
         with gr.Column():
             framing = gr.Radio(
                 FRAMING_CHOICES,
@@ -235,9 +294,7 @@ Primeiro teste com textos curtos (1–3 frases), pois a animação em CPU é a e
                 label="Formato do vídeo",
                 info="O 9:16 encaixa o vídeo inteiro em 1080x1920, sem cortar.",
             )
-            with gr.Row():
-                still = gr.Checkbox(value=True, label="Cabeça estável (still)")
-                enhancer = gr.Checkbox(value=False, label="Melhorar rosto (GFPGAN, mais lento)")
+            enhancer = gr.Checkbox(value=False, label="Melhorar rosto (GFPGAN, mais lento em CPU)")
             with gr.Accordion("Mais ajustes", open=False):
                 size = gr.Radio(
                     size_choices(default_backend), value=512, label="Resolução do rosto"
@@ -260,11 +317,13 @@ Primeiro teste com textos curtos (1–3 frases), pois a animação em CPU é a e
         trigger(
             fn=on_engine_change,
             inputs=engine,
-            outputs=[engine_info, still, enhancer, size],
+            outputs=[engine_info, motion, enhancer, size],
         )
+    hardware_timer = gr.Timer(2.0)
+    hardware_timer.tick(fn=refresh_hardware, inputs=engine, outputs=[engine_info, hardware_timer])
     btn.click(
         fn=generate,
-        inputs=[image, text, voice, speed, engine, framing, still, size, enhancer, fmt, background],
+        inputs=[image, text, voice, speed, engine, framing, motion, size, enhancer, fmt, background],
         outputs=[audio_out, video_out, report_out],
     )
 
@@ -275,6 +334,9 @@ if __name__ == "__main__":
         print(f"[motor] {backend.label} ({backend.name}): {mark}")
         for line in status.problems + status.warnings:
             print(f"        - {line}")
+        if status.ready:
+            report = backend.hardware()
+            print(f"        - {report or 'detectando GPU em segundo plano…'}")
 
     demo.queue(default_concurrency_limit=1).launch(
         server_name="127.0.0.1",

@@ -47,47 +47,69 @@ def wav(tmp_path):
     return path
 
 
-FAKE_SADTALKER = textwrap.dedent(
+FAKE_RUNNER = textwrap.dedent(
     """
-    # Imita a CLI do SadTalker: mesmos argumentos, mesmo formato de saída (MPEG-4 Part 2).
-    import argparse, os, subprocess, sys, time
+    # Imita a CLI do sadtalker_runner.py: mesmos argumentos, mesmas linhas de progresso,
+    # mesmo contrato de saída (vídeo H.264 sem áudio + meta JSON).
+    import argparse, json, math, os, subprocess, sys
+    import soundfile as sf
     from PIL import Image
 
     p = argparse.ArgumentParser()
-    for name in ("--driven_audio", "--source_image", "--result_dir", "--checkpoint_dir",
-                 "--preprocess", "--enhancer"):
+    for name in ("--image", "--audio", "--output", "--meta", "--checkpoint_dir", "--framing",
+                 "--motion", "--device", "--fp16", "--ffmpeg"):
         p.add_argument(name)
-    p.add_argument("--size", type=int)
-    p.add_argument("--still", action="store_true")
-    p.add_argument("--cpu", action="store_true")
+    for name in ("--size", "--seed", "--pose_style", "--batch", "--threads"):
+        p.add_argument(name, type=int, default=0)
+    p.add_argument("--enhancer", action="store_true")
     a = p.parse_args()
 
-    w, h = Image.open(a.source_image).size
-    vw, vh = (w, h) if a.preprocess == "full" else (a.size, a.size)
-    if a.enhancer:  # o GFPGAN do SadTalker usa upscale=2
-        vw, vh = vw * 2, vh * 2
-    os.makedirs(a.result_dir, exist_ok=True)
-    with open(os.path.join(a.result_dir, "argv.txt"), "w") as fh:
-        fh.write(" ".join(sys.argv[1:]))
-    out = os.path.join(a.result_dir, time.strftime("%Y_%m_%d_%H.%M.%S") + ".mp4")
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-framerate", "25",
-                    "-i", a.source_image, "-i", a.driven_audio, "-vf", f"scale={vw}:{vh}",
-                    "-c:v", "mpeg4", "-c:a", "aac", "-shortest", out], check=True)
-    print("The generated video is named:", out)
+    with open(os.path.join(os.path.dirname(a.output), "argv.txt"), "a") as fh:
+        fh.write(" ".join(sys.argv[1:]) + "\\n")
+    if os.environ.get("FAKE_NO_FACE"):
+        print("HG_ERROR no_face")
+        print("ERRO: nenhum rosto detectado na foto.")
+        sys.exit(13)
+    if os.environ.get("FAKE_ABORT"):  # abort() nativo no Windows sai com 3
+        print("OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll already initialized.")
+        sys.exit(3)
+    if os.environ.get("FAKE_GPU_FAILS") and a.device != "cpu":
+        print("HG_DEVICE_FAILED " + json.dumps({"error": "CUDA error: illegal memory access"}))
+        sys.exit(14)
+
+    on_gpu = a.device != "cpu"
+    print("HG_DEVICE " + json.dumps({"device": "cuda:0" if on_gpu else "cpu", "name": "Fake GPU" if on_gpu else None}))
+    for stage in ("load", "face", "audio"):
+        print("HG_PROGRESS " + json.dumps({"stage": stage, "done": 0, "total": 1}))
+    info = sf.info(a.audio)
+    frames = max(2, math.ceil(info.frames / info.samplerate * 25))
+    for done in (frames // 2, frames):
+        print("HG_PROGRESS " + json.dumps({"stage": "render", "done": done, "total": frames, "sec_per_frame": 0.01}))
+    w, h = Image.open(a.image).size
+    vw, vh = (w, h) if a.framing == "full" else (a.size, a.size)
+    subprocess.run([a.ffmpeg, "-y", "-loglevel", "error", "-loop", "1", "-framerate", "25", "-i", a.image,
+                    "-frames:v", str(frames), "-vf", "scale=%d:%d" % (vw, vh), "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", a.output], check=True)
+    with open(a.meta, "w") as fh:
+        json.dump({"frames": frames, "device": "cuda:0" if on_gpu else "cpu", "device_name": "Fake GPU" if on_gpu else "CPU",
+                   "fp16": on_gpu, "batch": 2 if on_gpu else 1, "threads": 4, "sec_per_frame": 0.01,
+                   "motion": a.motion}, fh)
+    print("SadTalkerNext OK: " + a.output)
     """
 )
 
 
 @pytest.fixture
 def fake_sadtalker(tmp_path):
+    """Pasta com a estrutura que o motor confere + o runner falso."""
     root = tmp_path / "SadTalker"
     (root / "checkpoints").mkdir(parents=True)
-    (root / "inference.py").write_text(FAKE_SADTALKER, encoding="utf-8")
+    (root / "src" / "facerender").mkdir(parents=True)
+    (root / "fake_runner.py").write_text(FAKE_RUNNER, encoding="utf-8")
     for name in (
         "SadTalker_V0.0.2_256.safetensors",
         "SadTalker_V0.0.2_512.safetensors",
         "mapping_00109-model.pth.tar",
-        "mapping_00229-model.pth.tar",
     ):
         (root / "checkpoints" / name).write_bytes(b"")
     return root

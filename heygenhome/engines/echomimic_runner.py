@@ -20,8 +20,12 @@ import json
 import os
 import sys
 
-EXIT_CONFIG = 2
-EXIT_NO_FACE = 3
+# Códigos próprios, longe de 1-4 (no Windows, abort() do runtime C sai com 3).
+EXIT_CONFIG = 12
+EXIT_NO_FACE = 13
+NO_FACE_MARKER = "HG_ERROR no_face"
+# Placas de "12 GB" reportam ~11,99 GiB: a mesma tolerância é usada na interface (gpu.py).
+VRAM_TOLERANCE_GB = 0.5
 
 PRESETS = {
     # modo: (config, passos, cfg)
@@ -47,7 +51,8 @@ def parse_args(argv=None):
     p.add_argument("--accelerated", action="store_true", help="pesos *_acc: 6 passos em vez de 30")
     p.add_argument("--config", default=None)
     p.add_argument("--size", type=int, default=512)
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto", help="auto | cpu | cuda | cuda:N")
+    p.add_argument("--min_vram_gb", type=float, default=12.0, help="auto só usa GPU com essa VRAM")
     p.add_argument("--fp16", action="store_true", help="só tem efeito em GPU")
     p.add_argument("--steps", type=int, default=0, help="0 = padrão do modo")
     p.add_argument("--cfg", type=float, default=0.0, help="0 = padrão do modo")
@@ -60,6 +65,65 @@ def parse_args(argv=None):
     p.add_argument("--context_overlap", type=int, default=3)
     p.add_argument("--sample_rate", type=int, default=16000)
     return p.parse_args(argv)
+
+
+def emit_progress(fraction, message):
+    print("HG_PROGRESS " + json.dumps({"fraction": round(fraction, 4), "message": message},
+                                      ensure_ascii=False), flush=True)
+
+
+def unicode_safe_cv2():
+    """cv2.imread do Windows não abre caminhos com acento (C:\\Users\\João\\...)."""
+    import cv2
+    import numpy as np
+
+    if os.name != "nt" or getattr(cv2.imread, "_hg_safe", False):
+        return
+    original_read = cv2.imread
+
+    def imread(path, flags=cv2.IMREAD_COLOR):
+        try:
+            data = np.fromfile(path, dtype=np.uint8)
+        except (OSError, ValueError):
+            return original_read(path, flags)
+        return cv2.imdecode(data, flags) if data.size else None
+
+    imread._hg_safe = True
+    cv2.imread = imread
+
+
+def pick_device(torch, request, min_vram_gb):
+    """auto: a GPU NVIDIA de mais VRAM (com VRAM suficiente) que passe num teste real; senão CPU."""
+    if request == "cpu":
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        print("CUDA indisponível neste PyTorch (%s); usando CPU." % torch.__version__)
+        return torch.device("cpu")
+    if request in ("auto", "cuda"):
+        order = sorted(range(torch.cuda.device_count()),
+                       key=lambda i: -torch.cuda.get_device_properties(i).total_memory)
+        candidates = [torch.device("cuda", i) for i in order]
+    else:
+        candidates = [torch.device("cuda", torch.device(request).index or 0)]
+    for dev in candidates:
+        props = torch.cuda.get_device_properties(dev)
+        vram = props.total_memory / 2 ** 30
+        if request == "auto" and vram + VRAM_TOLERANCE_GB < min_vram_gb:
+            print("GPU %s tem %.1f GB (< %.0f GB recomendados); ignorada." % (props.name, vram, min_vram_gb))
+            continue
+        try:
+            torch.cuda.set_device(dev)
+            x = torch.randn(1, 4, 32, 32, device=dev)
+            y = torch.nn.functional.conv2d(x, torch.randn(4, 4, 3, 3, device=dev), padding=1)
+            torch.cuda.synchronize(dev)
+            if not bool(torch.isfinite(y).all()):
+                raise RuntimeError("resultado inválido no teste da GPU")
+            print("GPU: %s (%.1f GB)" % (props.name, vram))
+            return dev
+        except Exception as exc:
+            print("GPU %s indisponível (%s)." % (props.name, str(exc)[:300]))
+    print("Nenhuma GPU utilizável; usando CPU.")
+    return torch.device("cpu")
 
 
 def load_state(torch, path):
@@ -109,6 +173,7 @@ def main(argv=None):
     from src.models.whisper.audio2feature import load_audio_model
     from src.utils.util import crop_and_pad, save_videos_grid
 
+    unicode_safe_cv2()
     mode = "accelerated" if args.accelerated else "standard"
     if args.accelerated:
         from src.pipelines.pipeline_echo_mimic_acc import Audio2VideoPipeline
@@ -118,10 +183,10 @@ def main(argv=None):
     steps = args.steps or default_steps
     cfg = args.cfg or default_cfg
 
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        print("CUDA indisponível; usando CPU.")
-        device = torch.device("cpu")
+    emit_progress(0.01, "Carregando o EchoMimic…")
+    device = pick_device(torch, args.device, args.min_vram_gb)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
     # fp16 em CPU não é suportado por várias operações do PyTorch.
     dtype = torch.float16 if (args.fp16 and device.type == "cuda") else torch.float32
     print("EchoMimic: modo={} device={} dtype={} passos={} cfg={} threads={}".format(
@@ -152,6 +217,7 @@ def main(argv=None):
     det_bboxes, probs = detector.detect(np.ascontiguousarray(image[:, :, ::-1]))
     bbox = select_face(det_bboxes, probs)
     if bbox is None:
+        print(NO_FACE_MARKER)
         print("ERRO: nenhum rosto detectado na foto. Use uma foto frontal, bem iluminada.")
         return EXIT_NO_FACE
 
@@ -211,7 +277,24 @@ def main(argv=None):
         scheduler=scheduler,
     ).to(device, dtype=dtype)
 
-    # 3) Geração.
+    # 3) Geração (progresso por passo de difusão).
+    class _Progress(object):
+        def __init__(self, total):
+            self.total, self.n = max(1, total or 1), 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def update(self, k=1):
+            self.n += k
+            emit_progress(0.15 + 0.75 * self.n / self.total,
+                          "Difusão: passo {}/{} em {}".format(self.n, self.total, device))
+
+    pipe.progress_bar = lambda iterable=None, total=None: _Progress(total)
+    emit_progress(0.15, "Gerando o rosto ({})…".format(device))
     face_mask_tensor = (
         torch.Tensor(face_mask).to(dtype=dtype, device=device).unsqueeze(0).unsqueeze(0).unsqueeze(0)
         / 255.0
@@ -232,6 +315,7 @@ def main(argv=None):
         context_overlap=args.context_overlap,
     ).videos
 
+    emit_progress(0.92, "Gravando o vídeo do rosto…")
     save_videos_grid(video, args.output, n_rows=1, fps=args.fps)
     with open(args.meta, "w") as fh:
         json.dump(

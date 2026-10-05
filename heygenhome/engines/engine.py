@@ -19,9 +19,12 @@ from .base import (
     FRAMING_CROP,
     FRAMING_FULL,
     FRAMINGS,
+    MOTION_NATURAL,
+    MOTIONS,
     AnimationOptions,
     AnimationRequest,
     EngineError,
+    ProgressCallback,
     TalkingHeadBackend,
 )
 
@@ -39,6 +42,7 @@ class EngineRun:
     log: Path | None = None
     notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    details: dict = field(default_factory=dict)
 
 
 class TalkingHeadEngine:
@@ -63,6 +67,7 @@ class TalkingHeadEngine:
         work_dir: Path,
         options: AnimationOptions,
         audio_duration: float | None = None,
+        progress: ProgressCallback | None = None,
     ) -> tuple[AnimationRequest, list[str]]:
         """Converte as escolhas da interface no pedido que o motor consegue atender."""
         caps = backend.capabilities
@@ -80,8 +85,12 @@ class TalkingHeadEngine:
             notes.append(f"{backend.label} gera {caps.sizes[0]} px; {size} px não se aplica.")
             size = caps.sizes[0]
 
-        if options.still and not caps.still:
-            notes.append(f"'Cabeça estável' não se aplica ao {backend.label}.")
+        if options.motion not in MOTIONS:
+            raise EngineError(f"Movimento inválido: {options.motion}")
+        motion = options.motion
+        if not caps.motion:
+            notes.append(f"O movimento do {backend.label} vem do próprio modelo (presets não se aplicam).")
+            motion = MOTION_NATURAL
         if options.enhancer and not caps.enhancer:
             notes.append(f"'Melhorar rosto' não se aplica ao {backend.label}.")
 
@@ -91,9 +100,10 @@ class TalkingHeadEngine:
             work_dir=work_dir,
             size=size,
             framing=framing,
-            still=options.still and caps.still,
+            motion=motion,
             enhancer=options.enhancer and caps.enhancer,
             audio_duration=audio_duration,
+            progress=progress,
         )
         return request, notes
 
@@ -105,6 +115,7 @@ class TalkingHeadEngine:
         work_dir: str | Path,
         options: AnimationOptions = AnimationOptions(),
         audio_duration: float | None = None,
+        progress: ProgressCallback | None = None,
     ) -> EngineRun:
         backend = self.get(key)
         status = backend.status()
@@ -122,7 +133,7 @@ class TalkingHeadEngine:
             raise EngineError(str(exc)) from exc
 
         request, notes = self.build_request(
-            backend, image.path, Path(audio), work_dir, options, audio_duration
+            backend, image.path, Path(audio), work_dir, options, audio_duration, progress
         )
 
         start = time.monotonic()
@@ -144,6 +155,7 @@ class TalkingHeadEngine:
             log=result.log,
             notes=image.notes + notes + result.notes + check_notes,
             warnings=warnings,
+            details=result.details,
         )
 
 

@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 
 from ..media import MediaError, paste_back
-from ._process import run_logged
+from ._process import EngineProcessError, run_logged
 from .base import (
     FRAMING_CROP,
     AnimationRequest,
@@ -27,21 +27,25 @@ from .base import (
     EngineError,
     EngineStatus,
     TalkingHeadBackend,
+    env_choice,
     env_flag,
     env_int,
     venv_python,
 )
+from .gpu import GpuProbe
 
 DEFAULT_DIR = r"C:\AI\EchoMimic"
 RUNNER = Path(__file__).with_name("echomimic_runner.py")
+MIN_VRAM_GB = 12  # fp16, modo acelerado
+NO_FACE_MARKER = "HG_ERROR no_face"
 
 
 class EchoMimicBackend(TalkingHeadBackend):
     key = "echomimic"
     label = "Experimental HD"
     name = "EchoMimic"
-    description = "EchoMimic (difusão): expressões mais naturais, mas muito lento em CPU."
-    capabilities = EngineCapabilities(sizes=(512,), still=False, enhancer=False, crop=True)
+    description = "EchoMimic (difusão): expressões mais naturais; precisa de GPU NVIDIA de 12 GB para ser prático."
+    capabilities = EngineCapabilities(sizes=(512,), motion=False, enhancer=False, crop=True)
 
     def __init__(
         self,
@@ -52,11 +56,13 @@ class EchoMimicBackend(TalkingHeadBackend):
     ):
         self.root = Path(root or os.getenv("ECHOMIMIC_DIR") or DEFAULT_DIR)
         self.python = Path(python or os.getenv("ECHOMIMIC_PYTHON") or venv_python(self.root))
-        self.device = (device or os.getenv("ECHOMIMIC_DEVICE") or "cpu").strip().lower()
+        self.device = (device or env_choice("ECHOMIMIC_DEVICE", "auto", ("auto", "cpu", "cuda"))).lower()
         self.accelerated = env_flag("ECHOMIMIC_ACCELERATED", True) if accelerated is None else accelerated
         self.steps = env_int("ECHOMIMIC_STEPS", 0)
         self.fps = env_int("ECHOMIMIC_FPS", 24)
         self.seed = env_int("ECHOMIMIC_SEED", 420)
+        # O mínimo de VRAM só vale no modo auto; cuda forçado usa a GPU mesmo assim (como o runner).
+        self.gpu = GpuProbe(self.python, self.root, min_vram_gb=MIN_VRAM_GB if self.device == "auto" else 0)
 
     @property
     def weights_dir(self) -> Path:
@@ -87,9 +93,16 @@ class EchoMimicBackend(TalkingHeadBackend):
             missing = [str(p.relative_to(self.root)) for p in self.expected_weights() if not p.exists()]
             if missing:
                 warnings.append("Pesos não encontrados: " + ", ".join(missing) + ".")
-        if self.device == "cpu":
+        report = self.gpu.result() if self.device != "cpu" else None
+        if self.device == "cpu" or (report is not None and not report.uses_gpu):
             warnings.append("Em CPU: ~14 min por segundo de vídeo (4 núcleos) e ~13 GB de RAM.")
         return EngineStatus(ready=not problems, problems=tuple(problems), warnings=tuple(warnings))
+
+    def hardware(self) -> str | None:
+        if self.device == "cpu":
+            return "CPU (ECHOMIMIC_DEVICE=cpu)."
+        report = self.gpu.result()
+        return None if report is None else report.summary
 
     def command(self, request: AnimationRequest, face_video: Path, meta: Path) -> list[str]:
         cmd = [
@@ -100,6 +113,7 @@ class EchoMimicBackend(TalkingHeadBackend):
             "--meta", str(meta),
             "--size", str(request.size),
             "--device", self.device,
+            "--min_vram_gb", str(MIN_VRAM_GB),
             "--fps", str(self.fps),
             "--seed", str(self.seed),
         ]
@@ -107,8 +121,8 @@ class EchoMimicBackend(TalkingHeadBackend):
             cmd += ["--frames", str(math.ceil(request.audio_duration * self.fps))]
         if self.accelerated:
             cmd.append("--accelerated")
-        if self.device.startswith("cuda"):
-            cmd.append("--fp16")  # como no EchoMimic oficial; em CPU fica fp32
+        if self.device != "cpu":
+            cmd.append("--fp16")  # como no EchoMimic oficial; o runner só aplica em GPU
         if self.steps:
             cmd += ["--steps", str(self.steps)]
         return cmd
@@ -120,17 +134,34 @@ class EchoMimicBackend(TalkingHeadBackend):
         meta_path = work / "rosto.json"
         log_path = request.work_dir / "echomimic.log"
 
-        run_logged(
-            self.command(request, face_video, meta_path),
-            cwd=self.root, log_path=log_path, label="EchoMimic",
-        )
+        def on_line(line: str) -> None:
+            tag, _, payload = line.partition(" ")
+            if tag == "HG_PROGRESS":
+                try:
+                    data = json.loads(payload)
+                except ValueError:
+                    return
+                request.report(float(data.get("fraction", 0)), data.get("message", "EchoMimic…"))
+
+        try:
+            run_logged(
+                self.command(request, face_video, meta_path),
+                cwd=self.root, log_path=log_path, label="EchoMimic", on_line=on_line,
+            )
+        except EngineProcessError as exc:
+            if NO_FACE_MARKER in exc.output:
+                raise EngineError(
+                    "O EchoMimic não detectou um rosto na foto. Use uma foto frontal, "
+                    f"bem iluminada e com o rosto visível. Log: {log_path}"
+                ) from exc
+            raise
         if not face_video.is_file() or not meta_path.is_file():
             raise EngineError(f"O EchoMimic terminou sem gerar o vídeo do rosto. Log: {log_path}")
 
-        if request.framing == FRAMING_CROP:
-            return AnimationResult(video=face_video, log=log_path)
-
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if request.framing == FRAMING_CROP:
+            return AnimationResult(video=face_video, log=log_path, details=meta)
+
         try:
             full = paste_back(request.image, face_video, tuple(meta["crop_rect"]), work / "foto_inteira.mp4")
         except (KeyError, MediaError) as exc:
@@ -139,4 +170,5 @@ class EchoMimicBackend(TalkingHeadBackend):
             video=full,
             log=log_path,
             notes=[f"Rosto animado em {request.size}x{request.size} e recolocado na foto inteira."],
+            details=meta,
         )

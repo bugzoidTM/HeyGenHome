@@ -9,7 +9,13 @@ import soundfile as sf
 pytest.importorskip("gradio")
 
 import app  # noqa: E402
-from heygenhome.engines import FRAMING_CROP, FRAMING_FULL, SadTalkerNextBackend, TalkingHeadEngine  # noqa: E402
+from heygenhome.engines import (  # noqa: E402
+    FRAMING_CROP,
+    FRAMING_FULL,
+    MOTION_NATURAL,
+    SadTalkerNextBackend,
+    TalkingHeadEngine,
+)
 from heygenhome.export import BACKGROUND_BLUR, FORMAT_ORIGINAL, FORMAT_VERTICAL  # noqa: E402
 from heygenhome.media import probe_video  # noqa: E402
 
@@ -25,7 +31,8 @@ def fake_synthesize(text, voice_label, speed, out_path):
 
 @pytest.fixture
 def app_env(tmp_path, monkeypatch, fake_sadtalker):
-    engine = TalkingHeadEngine([SadTalkerNextBackend(root=fake_sadtalker, python=sys.executable)])
+    engine = TalkingHeadEngine([SadTalkerNextBackend(root=fake_sadtalker, python=sys.executable,
+                                                     runner=fake_sadtalker / "fake_runner.py")])
     monkeypatch.setattr(app, "ENGINE", engine)
     monkeypatch.setattr(app, "OUTPUT_DIR", tmp_path / "outputs")
     monkeypatch.setattr(app, "synthesize", fake_synthesize)
@@ -49,10 +56,12 @@ def test_generate_end_to_end(app_env, framing, fmt, expected):
     photo = make_photo(app_env / "foto.jpg", size=(640, 480))
     wav, mp4, report = app.generate(
         str(photo), "Olá!", app.DEFAULT_VOICE, 1.0, "sadtalker_next",
-        framing, True, 512, False, fmt, BACKGROUND_BLUR, progress=no_progress,
+        framing, MOTION_NATURAL, 512, False, fmt, BACKGROUND_BLUR, progress=no_progress,
     )
     info = probe_video(mp4)
     assert info.size == expected
     assert (info.codec, info.audio_codec) == ("h264", "aac")
     assert "✅ resolução validada" in report
     assert "Standard (SadTalkerNext)" in report
+    assert "movimento natural" in report
+    assert "GPU Fake GPU · fp16 · lote 2" in report

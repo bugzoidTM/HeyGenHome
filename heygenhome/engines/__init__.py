@@ -7,6 +7,10 @@ inclua-a na lista de ``create_engine``. Kokoro, interface e exportação não mu
 from .base import (
     FRAMING_CROP,
     FRAMING_FULL,
+    MOTION_EXPRESSIVE,
+    MOTION_NATURAL,
+    MOTION_STILL,
+    MOTIONS,
     AnimationOptions,
     AnimationRequest,
     AnimationResult,
@@ -41,6 +45,10 @@ def create_engine(max_side: int | None = None) -> TalkingHeadEngine:
 __all__ = [
     "FRAMING_CROP",
     "FRAMING_FULL",
+    "MOTION_EXPRESSIVE",
+    "MOTION_NATURAL",
+    "MOTION_STILL",
+    "MOTIONS",
     "AnimationOptions",
     "AnimationRequest",
     "AnimationResult",

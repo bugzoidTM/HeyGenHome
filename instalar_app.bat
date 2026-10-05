@@ -17,6 +17,7 @@ echo 1. eSpeak-NG no Windows
 echo 2. FFmpeg
 echo 3. SadTalker e seus checkpoints 512 em ambiente separado (motor Standard)
 echo 4. Opcional: EchoMimic em ambiente separado (motor Experimental HD)
+echo Com GPU NVIDIA: troque o PyTorch do SadTalker pela versao CUDA (README, secao GPU).
 echo Veja o README.md.
 echo.
 pause
